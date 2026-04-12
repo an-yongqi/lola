@@ -2,8 +2,56 @@
 Attention conversion helpers
 """
 from functools import partial
+from typing import Optional
 from tqdm import tqdm
 import torch.nn as nn
+
+
+def compute_layer_budgets(total_budget: int, num_layers: int,
+                          strategy: str = 'uniform',
+                          layer_budgets: Optional[list] = None) -> list[int]:
+    """
+    计算每层的 sparse budget 分配
+
+    Args:
+        total_budget: 所有层的总 sparse budget
+        num_layers: 层数
+        strategy: 分配策略 ('uniform', 'pyramid', 'list')
+        layer_budgets: 直接指定每层 budget (strategy='list' 时使用)
+
+    Returns:
+        每层的 budget 列表
+    """
+    if strategy == 'list':
+        assert layer_budgets is not None and len(layer_budgets) == num_layers
+        return list(layer_budgets)
+
+    if strategy == 'uniform':
+        per_layer = total_budget // num_layers
+        budgets = [per_layer] * num_layers
+        # 余数分配给前几层
+        remainder = total_budget - per_layer * num_layers
+        for i in range(remainder):
+            budgets[i] += 1
+        return budgets
+
+    if strategy == 'pyramid':
+        # 首尾层多, 中间层少
+        mid = num_layers / 2.0
+        weights = []
+        for i in range(num_layers):
+            dist = abs(i - mid) / mid  # 0~1, 中间为0, 两端为1
+            weights.append(1.0 + dist)
+        total_weight = sum(weights)
+        budgets = [max(1, int(total_budget * w / total_weight)) for w in weights]
+        # 调整至恰好等于 total_budget
+        diff = total_budget - sum(budgets)
+        for i in range(abs(diff)):
+            idx = i % num_layers
+            budgets[idx] += 1 if diff > 0 else -1
+        return budgets
+
+    raise ValueError(f"Unknown budget strategy: {strategy}")
 
 
 def convert_attention(model: nn.Module, 
@@ -84,7 +132,20 @@ def convert_llama_attention(layer: nn.Module,
     """
     Converts a single layer's attention layer as specified by attention_config
     """
-    return get_attention(**attention_config)(
+    config = dict(attention_config)
+
+    # LoLA 跨层 budget 分配: 如果指定了 budget_strategy, 计算 per-layer budget
+    if 'budget_strategy' in config:
+        total = config.get('total_sparse_budget', config.get('sparse_budget', 128) * len(layers))
+        budgets = compute_layer_budgets(
+            total_budget=total,
+            num_layers=len(layers),
+            strategy=config['budget_strategy'],
+            layer_budgets=config.get('layer_budgets', None),
+        )
+        config['layer_sparse_budget'] = budgets[layer.self_attn.layer_idx]
+
+    return get_attention(**config)(
         base_attn=layer.self_attn,
         layer_idx=layer.self_attn.layer_idx,  # Transformers v4.36
         max_layer_idx=len(layers) - 1,
