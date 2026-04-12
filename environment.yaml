@@ -1,0 +1,28 @@
+name: lolcats-env
+channels:
+  - conda-forge
+  - pytorch
+  - huggingface
+  - nvidia
+dependencies:
+  - python>=3.10
+  - pip
+  - pytorch
+  - pytorch-cuda=12.1 # change depending on your supported CUDA version
+  - transformers=4.43.1 # Llama 3.1 support (updated RoPE)
+  - peft=0.9.0
+  - datasets=2.15.0
+  - nltk
+  - rouge-score
+  - sentencepiece
+  - ninja
+  - numpy
+  - pandas
+  - einops
+  - opt_einsum
+  - matplotlib
+  - omegaconf
+  - openai
+  - rich
+  - tqdm
+  - wandb
