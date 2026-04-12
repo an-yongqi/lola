@@ -44,7 +44,7 @@ def compute_sre(f_k: torch.Tensor, v: torch.Tensor,
         eps: 数值稳定性
 
     Returns:
-        sre: shape (b, h, l), 每个 token 的 SRE ��
+        sre: shape (b, h, l), 每个 token 的 SRE 值
     """
     if kv_state is None:
         # 全局近似: 用所有 token 构建线性状态
@@ -74,7 +74,7 @@ def select_sparse_tokens(sre: torch.Tensor, sparse_budget: int,
         sre: shape (b, h, l)
         sparse_budget: 选择的 token 数量
         mask_linear: shape (1, 1, q_len, k_len), 1 表示 below-window 区域
-        sink_size: sink token 数量 (从 SRE 选择中排除)
+        sink_size: 从 SRE 选择中排除的前 N 个 token (仅当含 sink 时传非零值)
         window_size: 窗口大小
 
     Returns:
@@ -128,25 +128,32 @@ def hybrid_attention_quadratic_lola(q: torch.Tensor, k: torch.Tensor,
                                     eps: float = 1e-12,
                                     mask_value: float = -1e8):
     """
-    三层混合注意力: 窗口 softmax + 稀疏 softmax + 线性注意力
+    三层混合注意力: 窗口 softmax + 稀疏 softmax + 线性���意力
     """
     b, h, q_len, d = q.shape
     k_len = k.shape[2]
 
     mask_window, mask_linear = get_masks(window_size, q_len, k_len, q.device)
 
+    # Sink token 仅在处理包含 sink 的 chunk 时激活:
+    # - kv_state is None → 首次 chunk 或全序列 (包含 sink token)
+    # - kv_state is not None → 后续 chunk (不包含 sink token)
+    effective_sink_size = sink_size if (sink_size > 0 and kv_state is None) else 0
+
     # --- SRE 计算和 sparse token 选择 ---
     with torch.no_grad():
         sre = compute_sre(f_k, v, kv_state=kv_state, k_state=k_state)
         sparse_mask = select_sparse_tokens(sre, sparse_budget, mask_linear,
-                                           sink_size=sink_size, window_size=window_size)
-        # sparse_mask: (b, h, 1, k_len), broadcast over queries
-        # 与 mask_linear 交集: 确保因果性
-        sparse_mask = sparse_mask.expand_as(mask_linear) & mask_linear.bool()
+                                           sink_size=effective_sink_size,
+                                           window_size=window_size)
+        # sparse_mask: (b, h, 1, k_len)
+        # 与 mask_linear 取交集确保因果性 — 使用 & 广播, 不用 expand_as
+        # (b, h, 1, k_len) & (1, 1, q_len, k_len) → (b, h, q_len, k_len)
+        sparse_mask = sparse_mask & mask_linear.bool()
         # 如有 sink token, 为其创建 mask
-        if sink_size > 0:
+        if effective_sink_size > 0:
             sink_mask = torch.zeros(1, 1, q_len, k_len, device=q.device, dtype=torch.bool)
-            sink_mask[:, :, :, :sink_size] = True
+            sink_mask[:, :, :, :effective_sink_size] = True
             # 因果性: sink 只对 position >= sink_size 的 query 可见 (对更早的 query 本身也可见)
             causal = torch.ones(q_len, k_len, device=q.device, dtype=torch.bool).tril(k_len - q_len)
             sink_mask = sink_mask & causal[None, None, ...]
@@ -155,17 +162,18 @@ def hybrid_attention_quadratic_lola(q: torch.Tensor, k: torch.Tensor,
         # 更新 linear mask: 去掉 sparse/sink token
         mask_linear_remaining = mask_linear.bool() & ~sparse_mask
 
+    # --- 共享 QK 计算 (避免重复 matmul) ---
+    qk = torch.einsum('bhmd,bhnd->bhmn', q.float(), k.float()) * (d ** -0.5)
+
     # --- 1. 窗口 softmax ---
-    a_sm = torch.einsum('bhmd,bhnd->bhmn', q.float(), k.float()) * (d ** -0.5)
-    a_sm = a_sm.masked_fill(~mask_window.bool(), mask_value)
+    a_sm = qk.masked_fill(~mask_window.bool(), mask_value)
     a_sm_max = torch.amax(a_sm, dim=-1, keepdim=True)
     a_sm = window_factor * torch.exp(a_sm - a_sm_max)
     sum_sm = a_sm.sum(dim=-1, keepdim=True)
 
     # --- 2. 稀疏 softmax ---
     if sparse_mask.any():
-        a_sp = torch.einsum('bhmd,bhnd->bhmn', q.float(), k.float()) * (d ** -0.5)
-        a_sp = a_sp.masked_fill(~sparse_mask, mask_value)
+        a_sp = qk.masked_fill(~sparse_mask, mask_value)
         a_sp_max = torch.amax(a_sp, dim=-1, keepdim=True)
         a_sp = sparse_factor * torch.exp(a_sp - a_sp_max)
         sum_sp = a_sp.sum(dim=-1, keepdim=True)
@@ -204,7 +212,7 @@ def hybrid_attention_quadratic_lola(q: torch.Tensor, k: torch.Tensor,
 
 
 # ----------------------
-# LoLA 注意力层
+# LoLA 注意��层
 # ----------------------
 class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
     """
@@ -286,6 +294,9 @@ class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
                 attn_weights = a_pred
             else:
                 past_key_value.window_size = self.decode_window_size
+                # 同步 LoLA 参数到缓存对象
+                past_key_value.sparse_budget = self.sparse_budget
+                past_key_value.sink_size = self.sink_size
                 if f_q.shape[2] == 1 and kv_seq_len > 1 and not self.training:
                     # --- 路径 3: 解码 ---
                     assert use_cache is True
@@ -324,7 +335,7 @@ class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
                         'bhlf,bhfd->bhld', f_q.float(), f_kv_state.float())
                     sum_ln = linear_factors * torch.einsum(
                         'bhlf,bhnf->bhl', f_q.float(), f_k_state.float())[..., None]
-                    y_true = (y_true / (sum_sm + sum_sp + sum_ln)).to(q.dtype)
+                    y_true = (y_true / (sum_sm + sum_sp + sum_ln + self.eps)).to(q.dtype)
 
                 else:
                     # --- 路径 4: 状态训练 (分块) ---
@@ -396,31 +407,38 @@ class LinearAttentionLoLACache(LinearAttentionSlidingWindowCache):
             else:
                 value_states_fp = value_states
 
+            is_first_chunk = len(self.k_states) <= layer_idx
+
             # 初始化 sink 缓存 (仅首次)
             if self.sink_size > 0 and len(self.sink_k_cache) <= layer_idx:
                 self.sink_k_cache.append(key_states[:, :, :self.sink_size, :])
                 self.sink_v_cache.append(value_states[:, :, :self.sink_size, :].to(dtype))
 
-            # 计算 decode 和 full KV state (与父类一致)
-            # 注意: sink token 不进入线性状态
-            start = self.sink_size if len(self.sink_k_cache) > layer_idx else 0
-            if key_states.shape[-2] > start + self.window_size:
-                fk_pre = fmap_key_states[:, :, start:-self.window_size]
-                v_pre = value_states_fp[:, :, start:-self.window_size]
+            # 只有首次 chunk 需要排除 sink token; 后续 chunk 无 sink
+            start = self.sink_size if (self.sink_size > 0 and is_first_chunk) else 0
+
+            # 从 start 开始的 token 分为 pre-window 和 window 两部分
+            # pre-window → decode_kv_state; window → k_cache/v_cache
+            seq_len = key_states.shape[-2]
+            non_sink_len = seq_len - start
+            if non_sink_len > self.window_size:
+                fk_pre = fmap_key_states[:, :, start:seq_len - self.window_size]
+                v_pre = value_states_fp[:, :, start:seq_len - self.window_size]
+                fk_win = fmap_key_states[:, :, seq_len - self.window_size:]
+                v_win = value_states_fp[:, :, seq_len - self.window_size:]
             else:
+                # 整个 non-sink 部分不足一个 window, 全部作为 window
                 fk_pre = fmap_key_states[:, :, :0]  # empty
                 v_pre = value_states_fp[:, :, :0]
+                fk_win = fmap_key_states[:, :, start:]
+                v_win = value_states_fp[:, :, start:]
 
             decode_kv_state = torch.einsum('bhlf,bhld->bhfd', fk_pre, v_pre)
-            kv_state = decode_kv_state + torch.einsum(
-                'bhlf,bhld->bhfd',
-                fmap_key_states[:, :, -self.window_size:],
-                value_states_fp[:, :, -self.window_size:]
-            )
+            kv_state = decode_kv_state + torch.einsum('bhlf,bhld->bhfd', fk_win, v_win)
             decode_k_state = fk_pre.sum(dim=-2, keepdim=True)
-            k_state = decode_k_state + fmap_key_states[:, :, -self.window_size:].sum(dim=-2, keepdim=True)
+            k_state = decode_k_state + fk_win.sum(dim=-2, keepdim=True)
 
-            if len(self.k_states) <= layer_idx:
+            if is_first_chunk:
                 self.kv_states.append(kv_state.to(dtype))
                 self.k_states.append(k_state.to(dtype))
                 self.decode_kv_states.append(decode_kv_state.to(dtype))
