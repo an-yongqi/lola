@@ -131,6 +131,11 @@ def get_attention(attention_type: str, **kwargs: any):
         from .linear_attention import LolcatsWindowAttentionTKGen
         return partial(LolcatsWindowAttentionTKGen, **kwargs)
 
+    ## LoLA: sliding window + sparse cache + linear attention
+    elif attention_type == 'lolcats_llama_window_lola':
+        from .linear_attention import LolcatsLoLAAttention
+        return partial(LolcatsLoLAAttention, **kwargs)
+
     else:
         print(f'-> attention_type {attention_type} not handled... returning None')
         return None
@@ -151,6 +156,10 @@ def get_attention_cache(attention_type: str, past_key_values: any = None):
     elif 'llama_window_tk' in attention_type:
         from .linear_attention import LinearAttentionTKWindowCache
         return LinearAttentionTKWindowCache()
+
+    elif 'lola' in attention_type:
+        from .linear_attention import LinearAttentionLoLACache
+        return LinearAttentionLoLACache()
 
     elif 'llama_window_sw' in attention_type:
         from .linear_attention import LinearAttentionSlidingWindowCache

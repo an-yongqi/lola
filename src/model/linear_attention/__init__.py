@@ -21,3 +21,6 @@ from .linear_window_attention_tk_gen import (
     LolcatsWindowAttentionTKGen,
     LinearAttentionTKWindowGenerationCache
 )
+from .linear_window_attention_lola import (
+    LolcatsLoLAAttention, LinearAttentionLoLACache
+)
