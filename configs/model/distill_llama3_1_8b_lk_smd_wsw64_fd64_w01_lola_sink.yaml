@@ -28,6 +28,8 @@ attention:
   sink_size: 4
   init_sparse_factor: 10.0
   train_sparse_factor: true
+  sparse_selection: chunked
+  sparse_chunk_size: null
   # Feature map 参数
   feature_map: softmax_dim
   feature_map_kwargs:

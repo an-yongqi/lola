@@ -7,6 +7,10 @@ LoLA: LoLCATs + Sparse Cache via Self-Recall Error (SRE)
 3. 线性状态 (linear): 其余 token 压缩到 recurrent state
 
 基于 linear_window_attention_sw.py 开发
+
+Sparse selection modes:
+- 'serial': per-token exact selection (reference, paper Eq.12-13)
+- 'chunked': per-chunk selection (efficient, paper Section 3.3)
 """
 from typing import List, Tuple, Optional, Callable
 import math
@@ -64,49 +68,228 @@ def compute_sre(f_k: torch.Tensor, v: torch.Tensor,
     return sre
 
 
-def select_sparse_tokens(sre: torch.Tensor, sparse_budget: int,
-                         mask_linear: torch.Tensor, sink_size: int = 0,
-                         window_size: int = 64) -> torch.Tensor:
+# ----------------------
+# Per-token serial sparse selection (exact reference)
+# ----------------------
+def select_sparse_tokens_serial(f_k: torch.Tensor, v: torch.Tensor,
+                                sparse_budget: int, window_size: int,
+                                q_len: int, k_len: int,
+                                sink_size: int = 0, eps: float = 1e-12,
+                                kv_state: torch.Tensor = None,
+                                k_state: torch.Tensor = None) -> torch.Tensor:
     """
-    基于 SRE 选择 sparse cache tokens (per-head)
+    Per-token serial sparse selection (exact reference implementation).
+    Paper Eq.12-13, 15: sequential processing with irreversible absorption.
+
+    For each query position t, as keys exit the sliding window:
+    1. Evicted key joins eligible set: E_t = G_{t-1} ∪ {evicted}
+    2. If |E_t| > sparse_budget: compute SRE with current H_t,
+       absorb min-SRE token into H_t (irreversible)
+    3. G_t = E_t \\ {absorbed}
+
+    Key property: once a token is absorbed into H, it NEVER returns to sparse cache.
 
     Args:
-        sre: shape (b, h, l)
-        sparse_budget: 选择的 token 数量
-        mask_linear: shape (1, 1, q_len, k_len), 1 表示 below-window 区域
-        sink_size: 从 SRE 选择中排除的前 N 个 token (仅当含 sink 时传非零值)
-        window_size: 窗口大小
+        f_k: feature-mapped keys (b, h, k_len, f)
+        v: values (b, h, k_len, d)
+        sparse_budget: max sparse cache size per head
+        window_size: sliding window size
+        q_len, k_len: query and key sequence lengths
+        sink_size: permanent sink tokens excluded from selection
+        eps: numerical stability
+        kv_state: pre-accumulated linear state H (b, h, f, d), for stateful training
+        k_state: pre-accumulated key state s (b, h, 1, f), for stateful training
 
     Returns:
-        sparse_mask: shape (b, h, 1, k_len), 被选中的 sparse token 位置为 True
+        sparse_mask: (b, h, q_len, k_len) per-query sparse token positions
     """
-    b, h, l = sre.shape
-    device = sre.device
+    b, h, _, f_dim = f_k.shape
+    d = v.shape[-1]
+    device = f_k.device
+    offset = k_len - q_len
 
-    # 只对 below-window 区域做选择 (用最后一行 mask 作为全局可选范围)
-    linear_eligible = mask_linear[0, 0, -1, :]  # (k_len,) - 最后一个 query 的 linear 区域
+    # Initialize linear state
+    if kv_state is not None:
+        H = kv_state.float().clone()
+        s = k_state.float().clone()
+    else:
+        H = torch.zeros(b, h, f_dim, d, device=device, dtype=torch.float32)
+        s = torch.zeros(b, h, 1, f_dim, device=device, dtype=torch.float32)
 
-    sre_for_selection = sre.clone()
-    # 排除 window 内的 token (linear_eligible 为 0 的位置)
-    sre_for_selection = sre_for_selection * linear_eligible[None, None, :]
-    # 排除 sink token
-    if sink_size > 0:
-        sre_for_selection[:, :, :sink_size] = 0
+    # Track which key positions are currently in sparse cache G, per (b, h)
+    is_in_G = torch.zeros(b, h, k_len, device=device, dtype=torch.bool)
 
-    # 实际可选 token 数量可能小于 sparse_budget
-    n_eligible = linear_eligible.sum().item() - sink_size
-    actual_budget = min(sparse_budget, max(0, int(n_eligible)))
+    # Output mask
+    sparse_mask = torch.zeros(b, h, q_len, k_len, device=device, dtype=torch.bool)
 
-    if actual_budget == 0:
-        # 没有可选 token, 返回全 False mask
-        return torch.zeros(b, h, 1, l, device=device, dtype=torch.bool)
+    # Next key position to be evicted from window
+    # Positions < sink_size are permanent sinks, never enter sparse/linear
+    next_evict = sink_size
 
-    # Per-head top-k 选择
-    _, sparse_idx = sre_for_selection.topk(actual_budget, dim=-1)  # b, h, actual_budget
+    for t in range(q_len):
+        # Below-window boundary for query t: keys at positions [0, bw_boundary] are below window
+        # From get_masks: linear_mask[t, j] = 1 iff j <= t + offset - window_size
+        bw_boundary = t + offset - window_size
 
-    # 构建 sparse mask: (b, h, 1, k_len)
-    sparse_mask = torch.zeros(b, h, 1, l, device=device, dtype=torch.bool)
-    sparse_mask.scatter_(-1, sparse_idx.unsqueeze(2), True)
+        # Process newly evicted keys (one per query step typically)
+        while next_evict <= bw_boundary and next_evict < k_len:
+            p = next_evict
+            next_evict += 1
+
+            # Check if adding p would exceed budget
+            # Note: n_in_G is the same for all (b,h) due to synchronized eviction timing
+            n_in_G = int(is_in_G[0, 0].sum().item())
+
+            if n_in_G >= sparse_budget:
+                # |E| = budget + 1 after adding p → must absorb one token
+                is_in_G[:, :, p] = True  # temporarily add p to eligible set
+
+                # Compute SRE for all eligible positions using current H
+                sre_all = compute_sre(f_k, v, kv_state=H, k_state=s, eps=eps)  # (b, h, k_len)
+                sre_all[~is_in_G] = float('inf')  # non-eligible → won't be selected as min
+
+                # Absorb the token with minimum SRE (least important)
+                _, absorb_pos = sre_all.min(dim=-1)  # (b, h) — position to absorb per head
+
+                # Update linear state H with absorbed token
+                pos_fk = absorb_pos[:, :, None, None].expand(-1, -1, 1, f_dim)
+                pos_v = absorb_pos[:, :, None, None].expand(-1, -1, 1, d)
+                absorbed_fk = torch.gather(f_k.float(), 2, pos_fk)  # (b, h, 1, f)
+                absorbed_v = torch.gather(v.float(), 2, pos_v)      # (b, h, 1, d)
+                H = H + torch.einsum('bhlf,bhld->bhfd', absorbed_fk, absorbed_v)
+                s = s + absorbed_fk  # broadcast: (b, h, 1, f)
+
+                # Remove absorbed token from G
+                is_in_G.scatter_(-1, absorb_pos.unsqueeze(-1), False)
+            else:
+                # Room in cache, just add
+                is_in_G[:, :, p] = True
+
+        # Record current G for query t
+        # Only include positions that are actually below window for this query
+        if bw_boundary >= 0:
+            end = min(bw_boundary + 1, k_len)
+            sparse_mask[:, :, t, :end] = is_in_G[:, :, :end]
+
+    return sparse_mask
+
+
+# ----------------------
+# Chunk-wise sparse selection (efficient)
+# ----------------------
+def select_sparse_tokens_chunked(f_k: torch.Tensor, v: torch.Tensor,
+                                 sparse_budget: int, window_size: int,
+                                 q_len: int, k_len: int,
+                                 chunk_size: int,
+                                 sink_size: int = 0, eps: float = 1e-12,
+                                 kv_state: torch.Tensor = None,
+                                 k_state: torch.Tensor = None) -> torch.Tensor:
+    """
+    Chunk-wise sparse selection (efficient for training and inference).
+    Paper Section 3.3: all queries within a chunk share the same sparse cache G_c.
+
+    At chunk boundaries:
+    1. Newly evicted keys (exited window during chunk) join eligible set:
+       E_c = G_{c-1} ∪ {evicted keys from chunk c}
+    2. If |E_c| > sparse_budget: compute SRE, keep top-budget, absorb rest into H
+    3. G_c used for all queries in next chunk
+
+    Key property: once a token is absorbed into H, it NEVER returns to sparse cache.
+    Chunk dependencies are sequential — G and H evolve at chunk boundaries.
+
+    Args:
+        f_k: feature-mapped keys (b, h, k_len, f)
+        v: values (b, h, k_len, d)
+        sparse_budget: max sparse cache size per head
+        window_size: sliding window size
+        q_len, k_len: query and key sequence lengths
+        chunk_size: processing chunk size (default: window_size)
+        sink_size: permanent sink tokens excluded from selection
+        eps: numerical stability
+        kv_state: pre-accumulated linear state H (b, h, f, d), for stateful training
+        k_state: pre-accumulated key state s (b, h, 1, f), for stateful training
+
+    Returns:
+        sparse_mask: (b, h, q_len, k_len) per-query sparse token positions
+    """
+    b, h, _, f_dim = f_k.shape
+    d = v.shape[-1]
+    device = f_k.device
+    offset = k_len - q_len
+
+    # Initialize linear state
+    if kv_state is not None:
+        H = kv_state.float().clone()
+        s_state = k_state.float().clone()
+    else:
+        H = torch.zeros(b, h, f_dim, d, device=device, dtype=torch.float32)
+        s_state = torch.zeros(b, h, 1, f_dim, device=device, dtype=torch.float32)
+
+    is_in_G = torch.zeros(b, h, k_len, device=device, dtype=torch.bool)
+    sparse_mask = torch.zeros(b, h, q_len, k_len, device=device, dtype=torch.bool)
+
+    # Last processed eviction boundary
+    prev_evict_end = sink_size - 1
+
+    num_chunks = (q_len + chunk_size - 1) // chunk_size
+    key_positions = torch.arange(k_len, device=device)
+
+    for c in range(num_chunks):
+        chunk_start = c * chunk_size
+        chunk_end = min((c + 1) * chunk_size, q_len)
+
+        # --- Process evictions FIRST → update G before writing mask ---
+        # This ensures queries in this chunk see the up-to-date sparse set.
+        last_query = chunk_end - 1
+        curr_evict_end = last_query + offset - window_size
+
+        evict_start = max(sink_size, prev_evict_end + 1)
+        evict_end = min(curr_evict_end, k_len - 1)
+
+        if evict_end >= evict_start:
+            # Build eligible set: current G + newly evicted tokens
+            eligible = is_in_G.clone()
+            eligible[:, :, evict_start:evict_end + 1] = True
+
+            # n_eligible is the same for all (b,h) due to synchronized eviction
+            n_eligible = int(eligible[0, 0].sum().item())
+
+            if n_eligible > sparse_budget:
+                # Compute SRE for eligible positions
+                sre_all = compute_sre(f_k, v, kv_state=H, k_state=s_state, eps=eps)
+                sre_all[~eligible] = -float('inf')  # non-eligible → won't be in top-k
+
+                # Select top-budget (highest SRE → most important → keep)
+                _, topk_idx = sre_all.topk(sparse_budget, dim=-1)  # (b, h, budget)
+
+                # New G: only the selected positions
+                new_G = torch.zeros_like(is_in_G)
+                new_G.scatter_(-1, topk_idx, True)
+
+                # Fallen tokens: eligible but not selected → absorb into H
+                fallen = eligible & ~new_G
+                fallen_mask = fallen.float().unsqueeze(-1)  # (b, h, k_len, 1)
+                fallen_fk = f_k.float() * fallen_mask
+                fallen_v = v.float() * fallen_mask
+                H = H + torch.einsum('bhlf,bhld->bhfd', fallen_fk, fallen_v)
+                s_state = s_state + fallen_fk.sum(dim=2, keepdim=True)
+
+                is_in_G = new_G
+            else:
+                # All eligible fit within budget
+                is_in_G = eligible
+
+        prev_evict_end = curr_evict_end
+
+        # --- THEN write updated G to sparse_mask for all queries in this chunk ---
+        # For query t: sparse position j is valid if j is in G AND j <= t + offset - window_size
+        query_indices = torch.arange(chunk_start, chunk_end, device=device)
+        bw_boundaries = query_indices + offset - window_size  # (chunk_len,)
+        # Vectorized: (chunk_len, k_len) mask of below-window positions per query
+        bw_mask = key_positions[None, :] <= bw_boundaries[:, None]
+        # Combine with current G: (b, h, chunk_len, k_len)
+        sparse_mask[:, :, chunk_start:chunk_end, :] = (
+            is_in_G[:, :, None, :] & bw_mask[None, None, :, :])
 
     return sparse_mask
 
@@ -125,10 +308,16 @@ def hybrid_attention_quadratic_lola(q: torch.Tensor, k: torch.Tensor,
                                     sink_size: int = 0,
                                     kv_state: torch.Tensor = None,
                                     k_state: torch.Tensor = None,
+                                    sparse_selection: str = 'chunked',
+                                    sparse_chunk_size: int = None,
                                     eps: float = 1e-12,
                                     mask_value: float = -1e8):
     """
-    三层混合注意力: 窗口 softmax + 稀疏 softmax + 线性���意力
+    三层混合注意力: 窗口 softmax + 稀疏 softmax + 线性注意力
+
+    Sparse selection modes:
+    - 'serial': per-token exact selection (reference, O(n²) per head)
+    - 'chunked': per-chunk selection (efficient, paper Section 3.3)
     """
     b, h, q_len, d = q.shape
     k_len = k.shape[2]
@@ -140,25 +329,35 @@ def hybrid_attention_quadratic_lola(q: torch.Tensor, k: torch.Tensor,
     # - kv_state is not None → 后续 chunk (不包含 sink token)
     effective_sink_size = sink_size if (sink_size > 0 and kv_state is None) else 0
 
-    # --- SRE 计算和 sparse token 选择 ---
+    # --- Per-query sparse token selection (handles SRE and H evolution internally) ---
     with torch.no_grad():
-        sre = compute_sre(f_k, v, kv_state=kv_state, k_state=k_state)
-        sparse_mask = select_sparse_tokens(sre, sparse_budget, mask_linear,
-                                           sink_size=effective_sink_size,
-                                           window_size=window_size)
-        # sparse_mask: (b, h, 1, k_len)
-        # 与 mask_linear 取交集确保因果性 — 使用 & 广播, 不用 expand_as
-        # (b, h, 1, k_len) & (1, 1, q_len, k_len) → (b, h, q_len, k_len)
+        if sparse_selection == 'serial':
+            sparse_mask = select_sparse_tokens_serial(
+                f_k, v, sparse_budget, window_size, q_len, k_len,
+                sink_size=effective_sink_size, eps=eps,
+                kv_state=kv_state, k_state=k_state)
+        else:  # 'chunked' (default)
+            chunk_size = sparse_chunk_size or window_size
+            sparse_mask = select_sparse_tokens_chunked(
+                f_k, v, sparse_budget, window_size, q_len, k_len,
+                chunk_size=chunk_size,
+                sink_size=effective_sink_size, eps=eps,
+                kv_state=kv_state, k_state=k_state)
+
+        # sparse_mask: (b, h, q_len, k_len) — per-query sparse positions
+        # Intersect with linear mask for safety (ensures below-window + causal)
         sparse_mask = sparse_mask & mask_linear.bool()
-        # 如有 sink token, 为其创建 mask
+
+        # Sink tokens: always attend via sparse softmax path
         if effective_sink_size > 0:
             sink_mask = torch.zeros(1, 1, q_len, k_len, device=q.device, dtype=torch.bool)
             sink_mask[:, :, :, :effective_sink_size] = True
-            # 因果性: sink 只对 position >= sink_size 的 query 可见 (对更早的 query 本身也可见)
+            # 因果性: sink 只对 position >= sink_size 的 query 可见
             causal = torch.ones(q_len, k_len, device=q.device, dtype=torch.bool).tril(k_len - q_len)
             sink_mask = sink_mask & causal[None, None, ...]
             # sink 从 linear 区域移除, 并入 sparse 路径
             sparse_mask = sparse_mask | sink_mask
+
         # 更新 linear mask: 去掉 sparse/sink token
         mask_linear_remaining = mask_linear.bool() & ~sparse_mask
 
@@ -205,14 +404,14 @@ def hybrid_attention_quadratic_lola(q: torch.Tensor, k: torch.Tensor,
 
     y = (y / (sum_sm + sum_sp + sum_ln + eps)).to(q.dtype)
 
-    # 注意力权重 (for distillation loss, not strictly needed but matches interface)
+    # 注意力权重 (for distillation loss)
     a = (a_combined / (sum_sm + sum_sp + sum_ln + eps)).to(q.dtype)
 
     return y, a
 
 
 # ----------------------
-# LoLA 注意��层
+# LoLA 注意力层
 # ----------------------
 class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
     """
@@ -224,10 +423,14 @@ class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
                  init_sparse_factor: float = 10.0,
                  train_sparse_factor: bool = True,
                  layer_sparse_budget: int = None,
+                 sparse_selection: str = 'chunked',
+                 sparse_chunk_size: int = None,
                  **kwargs):
         super().__init__(**kwargs)
         self.sparse_budget = layer_sparse_budget if layer_sparse_budget is not None else sparse_budget
         self.sink_size = sink_size
+        self.sparse_selection = sparse_selection
+        self.sparse_chunk_size = sparse_chunk_size
 
         # 新增可学习参数: sparse_factor (sigmoid 后 ≈ 1.0)
         device, dtype = self.q_proj.weight.device, self.q_proj.weight.dtype
@@ -278,6 +481,8 @@ class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
                 window_size=self.window_size,
                 sparse_budget=self.sparse_budget,
                 sink_size=self.sink_size,
+                sparse_selection=self.sparse_selection,
+                sparse_chunk_size=self.sparse_chunk_size,
             )
             attn_weights = ((a_pred, a_true), (y_pred, _y_true))
         else:
@@ -290,6 +495,8 @@ class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
                     window_size=self.window_size,
                     sparse_budget=self.sparse_budget,
                     sink_size=self.sink_size,
+                    sparse_selection=self.sparse_selection,
+                    sparse_chunk_size=self.sparse_chunk_size,
                 )
                 attn_weights = a_pred
             else:
@@ -352,6 +559,8 @@ class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
                         sink_size=self.sink_size,
                         kv_state=kv_state,
                         k_state=k_state,
+                        sparse_selection=self.sparse_selection,
+                        sparse_chunk_size=self.sparse_chunk_size,
                     )
                     past_key_value.update(k, v, self.layer_idx,
                                           fmap_key_states=f_k,
@@ -521,7 +730,15 @@ class LinearAttentionLoLACache(LinearAttentionSlidingWindowCache):
                     self.sparse_v_cache[layer_idx] = torch.cat([sparse_v, evicted_v.to(dtype)], dim=-2)
                     self.sparse_sre[layer_idx] = torch.cat([sparse_sre, evicted_sre], dim=-1)
                 else:
-                    # 稀疏缓存已满, 比较 SRE
+                    # 论文 Eq.12: 用当前 H_t 对所有 sparse cache entries 重新评分
+                    f_k_sparse = feature_map_k(sparse_k)
+                    num_sp = torch.einsum('bhfd,bhlf->bhld', kv_state.float(), f_k_sparse.float())
+                    den_sp = torch.einsum('bhnf,bhlf->bhl', k_state_acc.float(), f_k_sparse.float())
+                    v_hat_sp = num_sp / (den_sp[..., None] + 1e-12)
+                    sparse_sre = ((sparse_v.float() - v_hat_sp) ** 2).sum(dim=-1)  # b, h, budget
+                    self.sparse_sre[layer_idx] = sparse_sre
+
+                    # 比较 evicted token SRE 与更新后的最小 SRE
                     min_sre, min_idx = sparse_sre.min(dim=-1, keepdim=True)  # b, h, 1
                     should_replace = (evicted_sre > min_sre)  # b, h, 1
 
@@ -560,22 +777,20 @@ class LinearAttentionLoLACache(LinearAttentionSlidingWindowCache):
 
                         # 未被替换的 evicted token 进入线性状态
                         not_replace_mask = ~replace_mask
-                        f_k_state = f_k_evicted.to(dtype)
                         kv_evicted = torch.einsum(
                             'bhlf,bhld->bhfd', f_k_evicted.float(), evicted_v.float()
                         ).to(dtype)
                         self.decode_kv_states[layer_idx] = self.decode_kv_states[layer_idx] + (
                             kv_evicted * not_replace_mask)
                         self.decode_k_states[layer_idx] = self.decode_k_states[layer_idx] + (
-                            f_k_state * not_replace_mask)
+                            f_k_evicted.to(dtype) * not_replace_mask)
                     else:
                         # 所有 evicted token 都进入线性状态
-                        f_k_state = feature_map_k(evicted_k)
                         kv_state_new = torch.einsum(
-                            'bhlf,bhld->bhfd', f_k_state.float(), evicted_v.float()
+                            'bhlf,bhld->bhfd', f_k_evicted.float(), evicted_v.float()
                         ).to(dtype)
                         self.decode_kv_states[layer_idx] = self.decode_kv_states[layer_idx] + kv_state_new
-                        self.decode_k_states[layer_idx] = self.decode_k_states[layer_idx] + f_k_state.to(dtype)
+                        self.decode_k_states[layer_idx] = self.decode_k_states[layer_idx] + f_k_evicted.to(dtype)
 
                 # 移动窗口
                 self.k_cache[layer_idx] = torch.cat([k_cache[:, :, 1:, :], keys], dim=-2)

@@ -28,6 +28,8 @@ attention:
   sink_size: 0
   init_sparse_factor: 10.0
   train_sparse_factor: true
+  sparse_selection: chunked
+  sparse_chunk_size: null
   # 跨层 budget 分配
   budget_strategy: uniform  # uniform / pyramid / list
   total_sparse_budget: 4096  # 32 layers * 128 = 4096

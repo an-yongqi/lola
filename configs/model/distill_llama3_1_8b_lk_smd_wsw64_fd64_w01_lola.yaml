@@ -28,6 +28,9 @@ attention:
   sink_size: 0
   init_sparse_factor: 10.0
   train_sparse_factor: true
+  # Sparse selection: 'serial' (exact per-token) or 'chunked' (efficient per-chunk)
+  sparse_selection: chunked
+  sparse_chunk_size: null  # null = use window_size as chunk_size
   # Feature map 参数
   feature_map: softmax_dim
   feature_map_kwargs:
