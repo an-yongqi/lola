@@ -26,8 +26,6 @@ attention:
   # LoLA + Sink + Budget 参数
   sparse_budget: 128
   sink_size: 4
-  init_sparse_factor: 10.0
-  train_sparse_factor: true
   sparse_selection: chunked
   sparse_chunk_size: null
   # 跨层 budget 分配

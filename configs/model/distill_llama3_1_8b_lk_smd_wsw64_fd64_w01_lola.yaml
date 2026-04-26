@@ -23,13 +23,10 @@ attention:
   window_size: 64
   affine_attention_factors: false
   init_window_factor: -2.1972245773362196
-  # LoLA 特有参数
+  # LoLA 特有参数 (sparse + window + sink 共享同一 softmax, 复用 window_factor)
   sparse_budget: 128
   sink_size: 0
-  init_sparse_factor: 10.0
-  train_sparse_factor: true
-  # Sparse selection: 'serial' (exact per-token) or 'chunked' (efficient per-chunk)
-  sparse_selection: chunked
+  sparse_selection: chunked  # 'serial' (exact per-token) or 'chunked' (efficient per-chunk)
   sparse_chunk_size: null  # null = use window_size as chunk_size
   # Feature map 参数
   feature_map: softmax_dim

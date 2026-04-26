@@ -1,12 +1,14 @@
 """
 LoLA: LoLCATs + Sparse Cache via Self-Recall Error (SRE)
 
-三层混合注意力:
-1. 滑动窗口 (softmax): 最近 window_size 个 token
-2. 稀疏缓存 (softmax): SRE 选出的重要 token
-3. 线性状态 (linear): 其余 token 压缩到 recurrent state
+两层混合注意力 (与 base LoLCATs 结构一致):
+1. 统一 softmax: 滑动窗口 + SRE 选出的稀疏 token + sink token
+2. 线性注意力: 其余 token 压缩到 recurrent state
 
-基于 linear_window_attention_sw.py 开发
+仅 softmax mask 比 base LoLCATs 更大 (扩展了 sparse/sink 位置),
+factor 完全复用 window_factor / linear_factor, 无需额外参数.
+
+Token 生命周期 (不可逆): window → sparse → linear
 
 Sparse selection modes:
 - 'serial': per-token exact selection (reference, paper Eq.12-13)
@@ -113,8 +115,10 @@ def select_sparse_tokens_serial(f_k: torch.Tensor, v: torch.Tensor,
         H = kv_state.float().clone()
         s = k_state.float().clone()
     else:
-        H = torch.zeros(b, h, f_dim, d, device=device, dtype=torch.float32)
-        s = torch.zeros(b, h, 1, f_dim, device=device, dtype=torch.float32)
+        # Warm-start: 用全局线性状态初始化, 避免 H=0 时 SRE 退化为 ||v||²
+        # SRE 仅用于选择 (no_grad), 不影响注意力计算的因果性
+        H = torch.einsum('bhlf,bhld->bhfd', f_k.float(), v.float())
+        s = f_k.float().sum(dim=2, keepdim=True)  # b, h, 1, f
 
     # Track which key positions are currently in sparse cache G, per (b, h)
     is_in_G = torch.zeros(b, h, k_len, device=device, dtype=torch.bool)
@@ -222,8 +226,9 @@ def select_sparse_tokens_chunked(f_k: torch.Tensor, v: torch.Tensor,
         H = kv_state.float().clone()
         s_state = k_state.float().clone()
     else:
-        H = torch.zeros(b, h, f_dim, d, device=device, dtype=torch.float32)
-        s_state = torch.zeros(b, h, 1, f_dim, device=device, dtype=torch.float32)
+        # Warm-start: 用全局线性状态初始化, 避免 H=0 时 SRE 退化为 ||v||²
+        H = torch.einsum('bhlf,bhld->bhfd', f_k.float(), v.float())
+        s_state = f_k.float().sum(dim=2, keepdim=True)
 
     is_in_G = torch.zeros(b, h, k_len, device=device, dtype=torch.bool)
     sparse_mask = torch.zeros(b, h, q_len, k_len, device=device, dtype=torch.bool)
@@ -295,14 +300,13 @@ def select_sparse_tokens_chunked(f_k: torch.Tensor, v: torch.Tensor,
 
 
 # ----------------------
-# 三层混合注意力
+# 两层混合注意力
 # ----------------------
 def hybrid_attention_quadratic_lola(q: torch.Tensor, k: torch.Tensor,
                                     f_q: torch.Tensor, f_k: torch.Tensor,
                                     v: torch.Tensor,
                                     window_factor: torch.Tensor,
                                     linear_factor: torch.Tensor,
-                                    sparse_factor: torch.Tensor,
                                     window_size: int,
                                     sparse_budget: int = 128,
                                     sink_size: int = 0,
@@ -313,23 +317,19 @@ def hybrid_attention_quadratic_lola(q: torch.Tensor, k: torch.Tensor,
                                     eps: float = 1e-12,
                                     mask_value: float = -1e8):
     """
-    三层混合注意力: 窗口 softmax + 稀疏 softmax + 线性注意力
-
-    Sparse selection modes:
-    - 'serial': per-token exact selection (reference, O(n²) per head)
-    - 'chunked': per-chunk selection (efficient, paper Section 3.3)
+    两层混合注意力: 统一 softmax (window + sparse + sink) + 线性注意力.
+    与 base LoLCATs hybrid_attention_quadratic 结构完全一致,
+    仅 softmax mask 扩展了 SRE 选出的 sparse/sink 位置.
     """
     b, h, q_len, d = q.shape
     k_len = k.shape[2]
 
     mask_window, mask_linear = get_masks(window_size, q_len, k_len, q.device)
 
-    # Sink token 仅在处理包含 sink 的 chunk 时激活:
-    # - kv_state is None → 首次 chunk 或全序列 (包含 sink token)
-    # - kv_state is not None → 后续 chunk (不包含 sink token)
+    # Sink token 仅在处理包含 sink 的 chunk 时激活
     effective_sink_size = sink_size if (sink_size > 0 and kv_state is None) else 0
 
-    # --- Per-query sparse token selection (handles SRE and H evolution internally) ---
+    # --- Per-query sparse token selection ---
     with torch.no_grad():
         if sparse_selection == 'serial':
             sparse_mask = select_sparse_tokens_serial(
@@ -344,68 +344,49 @@ def hybrid_attention_quadratic_lola(q: torch.Tensor, k: torch.Tensor,
                 sink_size=effective_sink_size, eps=eps,
                 kv_state=kv_state, k_state=k_state)
 
-        # sparse_mask: (b, h, q_len, k_len) — per-query sparse positions
-        # Intersect with linear mask for safety (ensures below-window + causal)
+        # Intersect with linear mask (ensures below-window + causal)
         sparse_mask = sparse_mask & mask_linear.bool()
 
-        # Sink tokens: always attend via sparse softmax path
+        # Sink tokens: always attend via softmax
         if effective_sink_size > 0:
             sink_mask = torch.zeros(1, 1, q_len, k_len, device=q.device, dtype=torch.bool)
             sink_mask[:, :, :, :effective_sink_size] = True
-            # 因果性: sink 只对 position >= sink_size 的 query 可见
             causal = torch.ones(q_len, k_len, device=q.device, dtype=torch.bool).tril(k_len - q_len)
             sink_mask = sink_mask & causal[None, None, ...]
-            # sink 从 linear 区域移除, 并入 sparse 路径
             sparse_mask = sparse_mask | sink_mask
 
-        # 更新 linear mask: 去掉 sparse/sink token
+        # 统一 softmax mask = window + sparse + sink
+        mask_softmax = mask_window.bool() | sparse_mask
+        # 剩余 linear 位置
         mask_linear_remaining = mask_linear.bool() & ~sparse_mask
 
-    # --- 共享 QK 计算 (避免重复 matmul) ---
+    # --- 共享 QK 计算 ---
     qk = torch.einsum('bhmd,bhnd->bhmn', q.float(), k.float()) * (d ** -0.5)
 
-    # --- 1. 窗口 softmax ---
-    a_sm = qk.masked_fill(~mask_window.bool(), mask_value)
+    # --- 1. 统一 softmax (window + sparse + sink) ---
+    a_sm = qk.masked_fill(~mask_softmax, mask_value)
     a_sm_max = torch.amax(a_sm, dim=-1, keepdim=True)
     a_sm = window_factor * torch.exp(a_sm - a_sm_max)
     sum_sm = a_sm.sum(dim=-1, keepdim=True)
 
-    # --- 2. 稀疏 softmax ---
-    if sparse_mask.any():
-        a_sp = qk.masked_fill(~sparse_mask, mask_value)
-        a_sp_max = torch.amax(a_sp, dim=-1, keepdim=True)
-        a_sp = sparse_factor * torch.exp(a_sp - a_sp_max)
-        sum_sp = a_sp.sum(dim=-1, keepdim=True)
-
-        # 数值稳定: 统一 window 和 sparse 的 max 值
-        max_all = torch.maximum(a_sm_max, a_sp_max)
-        a_sm = a_sm * torch.exp(a_sm_max - max_all)
-        a_sp = a_sp * torch.exp(a_sp_max - max_all)
-        sum_sm = a_sm.sum(dim=-1, keepdim=True)
-        sum_sp = a_sp.sum(dim=-1, keepdim=True)
-    else:
-        a_sp = torch.zeros_like(a_sm)
-        sum_sp = torch.zeros_like(sum_sm)
-
-    # --- 3. 线性注意力 (remaining below-window tokens) ---
+    # --- 2. 线性注意力 (remaining below-window tokens) ---
     a_ln = torch.einsum('bhmd,bhnd->bhmn', f_q.float(), f_k.float())
     a_ln = linear_factor * a_ln.masked_fill(~mask_linear_remaining, 0)
     sum_ln = a_ln.sum(dim=-1, keepdim=True)
 
-    # --- 4. 联合归一化 ---
-    a_combined = a_sm + a_sp + a_ln
+    # --- 3. 联合归一化 (与 base LoLCATs 一致) ---
+    a_combined = a_sm + a_ln
     y = torch.einsum('bhmn,bhnd->bhmd', a_combined, v.float())
 
-    # 如有先前累积的线性状态 (stateful training)
     if kv_state is not None:
         y = y + linear_factor * torch.einsum('bhld,bhdf->bhlf', f_q.float(), kv_state.float())
         sum_ln = sum_ln + linear_factor * torch.einsum(
             'bhld,bhnd->bhl', f_q.float(), k_state.float())[..., None]
 
-    y = (y / (sum_sm + sum_sp + sum_ln + eps)).to(q.dtype)
+    y = (y / (sum_sm + sum_ln + eps)).to(q.dtype)
 
     # 注意力权重 (for distillation loss)
-    a = (a_combined / (sum_sm + sum_sp + sum_ln + eps)).to(q.dtype)
+    a = (a_combined / (sum_sm + sum_ln + eps)).to(q.dtype)
 
     return y, a
 
@@ -420,27 +401,18 @@ class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
     def __init__(self,
                  sparse_budget: int = 128,
                  sink_size: int = 0,
-                 init_sparse_factor: float = 10.0,
-                 train_sparse_factor: bool = True,
                  layer_sparse_budget: int = None,
                  sparse_selection: str = 'chunked',
                  sparse_chunk_size: int = None,
                  **kwargs):
+        # 移除旧版 sparse_factor 参数 (不再需要独立系数)
+        for legacy_key in ('init_sparse_factor', 'train_sparse_factor', 'share_sparse_window_factor'):
+            kwargs.pop(legacy_key, None)
         super().__init__(**kwargs)
         self.sparse_budget = layer_sparse_budget if layer_sparse_budget is not None else sparse_budget
         self.sink_size = sink_size
         self.sparse_selection = sparse_selection
         self.sparse_chunk_size = sparse_chunk_size
-
-        # 新增可学习参数: sparse_factor (sigmoid 后 ≈ 1.0)
-        device, dtype = self.q_proj.weight.device, self.q_proj.weight.dtype
-        if train_sparse_factor:
-            self.sparse_factors = nn.Parameter(
-                init_sparse_factor * torch.ones(1, self.num_heads, 1, 1, device=device, dtype=dtype))
-        else:
-            self.register_buffer(
-                "sparse_factors",
-                init_sparse_factor * torch.ones(1, self.num_heads, 1, 1, device=device, dtype=dtype))
 
     def forward(self,
                 hidden_states: torch.Tensor,
@@ -453,20 +425,19 @@ class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
                ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """
         Forward pass with 4 paths:
-        1. train_attention (蒸馏): ground truth + predicted 三层混合注意力
-        2. regular training (无 cache): 全序列三层混合注意力
-        3. decoding (生成): 窗口 + 稀疏 + 线性
-        4. stateful training (分块): 三层混合注意力 + 累积状态
+        1. train_attention (蒸馏): ground truth + predicted 两层混合注意力
+        2. regular training (无 cache): 全序列两层混合注意力
+        3. decoding (生成): 统一 softmax (window+sparse+sink) + 线性
+        4. stateful training (分块): 两层混合注意力 + 累积状态
         """
         b, l, _ = hidden_states.size()
         q, k, v, kv_seq_len = self.process_qkv(hidden_states, attention_mask,
                                                position_ids, past_key_value)
         f_q, f_k = self.feature_map_q(q), self.feature_map_k(k)
 
-        # 三个门控
+        # 两个门控 (与 base LoLCATs 完全一致)
         window_factors = F.sigmoid(self.window_factors)
         linear_factors = 1 - window_factors if self.affine_attention_factors else 1
-        sparse_factors = F.sigmoid(self.sparse_factors)
 
         if self.train_attention:
             # --- 路径 1: 蒸馏 ---
@@ -477,7 +448,7 @@ class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
 
             y_pred, a_pred = hybrid_attention_quadratic_lola(
                 q, k, f_q, f_k, v,
-                window_factors, linear_factors, sparse_factors,
+                window_factors, linear_factors,
                 window_size=self.window_size,
                 sparse_budget=self.sparse_budget,
                 sink_size=self.sink_size,
@@ -491,7 +462,7 @@ class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
                 # --- 路径 2: 常规训练 ---
                 y_true, a_pred = hybrid_attention_quadratic_lola(
                     q, k, f_q, f_k, v,
-                    window_factors, linear_factors, sparse_factors,
+                    window_factors, linear_factors,
                     window_size=self.window_size,
                     sparse_budget=self.sparse_budget,
                     sink_size=self.sink_size,
@@ -501,7 +472,6 @@ class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
                 attn_weights = a_pred
             else:
                 past_key_value.window_size = self.decode_window_size
-                # 同步 LoLA 参数到缓存对象
                 past_key_value.sparse_budget = self.sparse_budget
                 past_key_value.sink_size = self.sink_size
                 if f_q.shape[2] == 1 and kv_seq_len > 1 and not self.training:
@@ -512,37 +482,26 @@ class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
                                                              dtype=q.dtype)
                     k_cache, v_cache, f_kv_state, f_k_state, sparse_k, sparse_v = _kv
 
-                    # 窗口 softmax
-                    a_sm = torch.einsum('bhmd,bhnd->bhmn', q.float(), k_cache.float()) * (k.shape[-1] ** -0.5)
+                    # 拼接 window + sparse(含 sink) → 统一 softmax
+                    if sparse_k is not None and sparse_k.shape[-2] > 0:
+                        k_sm = torch.cat([k_cache, sparse_k], dim=-2)
+                        v_sm = torch.cat([v_cache, sparse_v], dim=-2)
+                    else:
+                        k_sm = k_cache
+                        v_sm = v_cache
+
+                    a_sm = torch.einsum('bhmd,bhnd->bhmn', q.float(), k_sm.float()) * (k.shape[-1] ** -0.5)
                     a_sm_max = torch.amax(a_sm, dim=-1, keepdim=True)
                     a_sm = window_factors * torch.exp(a_sm - a_sm_max)
                     sum_sm = a_sm.sum(dim=-1, keepdim=True)
 
-                    # 稀疏 softmax (sparse + sink)
-                    if sparse_k is not None and sparse_k.shape[-2] > 0:
-                        a_sp = torch.einsum('bhmd,bhnd->bhmn', q.float(), sparse_k.float()) * (k.shape[-1] ** -0.5)
-                        a_sp_max = torch.amax(a_sp, dim=-1, keepdim=True)
-                        a_sp = sparse_factors * torch.exp(a_sp - a_sp_max)
-                        sum_sp = a_sp.sum(dim=-1, keepdim=True)
-                        # 数值稳定: 统一 max
-                        max_all = torch.maximum(a_sm_max, a_sp_max)
-                        a_sm = a_sm * torch.exp(a_sm_max - max_all)
-                        a_sp = a_sp * torch.exp(a_sp_max - max_all)
-                        sum_sm = a_sm.sum(dim=-1, keepdim=True)
-                        sum_sp = a_sp.sum(dim=-1, keepdim=True)
-                    else:
-                        a_sp = None
-                        sum_sp = torch.zeros_like(sum_sm)
-
-                    # 联合归一化
-                    y_true = torch.einsum('bhmn,bhnd->bhmd', a_sm, v_cache.float())
-                    if a_sp is not None:
-                        y_true = y_true + torch.einsum('bhmn,bhnd->bhmd', a_sp, sparse_v.float())
+                    # 线性注意力 + 联合归一化
+                    y_true = torch.einsum('bhmn,bhnd->bhmd', a_sm, v_sm.float())
                     y_true = y_true + linear_factors * torch.einsum(
                         'bhlf,bhfd->bhld', f_q.float(), f_kv_state.float())
                     sum_ln = linear_factors * torch.einsum(
                         'bhlf,bhnf->bhl', f_q.float(), f_k_state.float())[..., None]
-                    y_true = (y_true / (sum_sm + sum_sp + sum_ln + self.eps)).to(q.dtype)
+                    y_true = (y_true / (sum_sm + sum_ln + self.eps)).to(q.dtype)
 
                 else:
                     # --- 路径 4: 状态训练 (分块) ---
@@ -553,7 +512,7 @@ class LolcatsLoLAAttention(LolcatsSlidingWindowAttention):
                         kv_state, k_state = None, None
                     y_true, _ = hybrid_attention_quadratic_lola(
                         q, k, f_q, f_k, v,
-                        window_factors, linear_factors, sparse_factors,
+                        window_factors, linear_factors,
                         window_size=self.window_size,
                         sparse_budget=self.sparse_budget,
                         sink_size=self.sink_size,
@@ -646,6 +605,14 @@ class LinearAttentionLoLACache(LinearAttentionSlidingWindowCache):
             kv_state = decode_kv_state + torch.einsum('bhlf,bhld->bhfd', fk_win, v_win)
             decode_k_state = fk_pre.sum(dim=-2, keepdim=True)
             k_state = decode_k_state + fk_win.sum(dim=-2, keepdim=True)
+
+            # Fix: sink token 加入 kv_state (训练跨 chunk), 但不加入 decode_kv_state
+            # (解码时 sink_k/v_cache 走 softmax, 避免重复计入)
+            if self.sink_size > 0 and is_first_chunk:
+                fk_sink = fmap_key_states[:, :, :self.sink_size]
+                v_sink = value_states_fp[:, :, :self.sink_size]
+                kv_state = kv_state + torch.einsum('bhlf,bhld->bhfd', fk_sink, v_sink)
+                k_state = k_state + fk_sink.sum(dim=-2, keepdim=True)
 
             if is_first_chunk:
                 self.kv_states.append(kv_state.to(dtype))
